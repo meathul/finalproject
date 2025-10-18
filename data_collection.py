@@ -108,10 +108,18 @@ def get_or_create_aoi(aoi_name: str, aoi_path: Path = AOI_PATH) -> gpd.GeoDataFr
     return gdf
 
 
-def clip_write(src_path: Path, geom_gdf: gpd.GeoDataFrame, out_path: Path):
-    """Clip a raster to AOI geometry and write GeoTIFF."""
+def clip_write(src_path: Path | str, geom_gdf: gpd.GeoDataFrame, out_path: Path):
+    """Clip a raster (local path or URL) to AOI geometry and write GeoTIFF.
+    Reprojects AOI to raster CRS if needed and fixes minor geometry issues.
+    """
     with rasterio.open(src_path) as src:
-        geoms = [mapping(geom) for geom in geom_gdf.geometry]
+        aoi = geom_gdf
+        try:
+            if aoi.crs and src.crs and aoi.crs != src.crs:
+                aoi = aoi.to_crs(src.crs)
+        except Exception:
+            pass
+        geoms = [mapping(geom.buffer(0)) for geom in aoi.geometry]
         out_image, out_transform = rio_mask(src, geoms, crop=True)
         out_meta = src.meta.copy()
         out_meta.update({
@@ -131,9 +139,11 @@ def download_dem_via_elevation(aoi_gdf: gpd.GeoDataFrame, out_path: Path = DEM_D
     if out_path.exists() and not overwrite:
         return out_path
     minx, miny, maxx, maxy = aoi_gdf.total_bounds
-    elevation.clip(bounds=(minx, miny, maxx, maxy), output=str(out_path), product='SRTM3')
+    # Use absolute path so GDAL invoked by elevation (via make) writes to the correct location
+    abs_out = out_path.resolve()
+    elevation.clip(bounds=(minx, miny, maxx, maxy), output=str(abs_out), product='SRTM3')
     # mask to AOI for clean edges
-    return clip_write(out_path, aoi_gdf, out_path)
+    return clip_write(abs_out, aoi_gdf, abs_out)
 
 
 def pick_best_cloud_item(items):
@@ -148,33 +158,30 @@ def download_sentinel_pc(aoi_gdf: gpd.GeoDataFrame, start_date: str, end_date: s
     if pc is None or Client is None:
         raise RuntimeError('planetary-computer/pystac-client not installed')
     client = Client.open('https://planetarycomputer.microsoft.com/api/stac/v1')
-    geom = mapping(aoi_gdf.unary_union)
+    geom = mapping(aoi_gdf.union_all() if hasattr(aoi_gdf, 'union_all') else aoi_gdf.unary_union)
     search = client.search(
         collections=['sentinel-2-l2a'],
         intersects=geom,
         datetime=f"{start_date}/{end_date}",
         query={'eo:cloud_cover': {'lte': max_cloud}}
     )
-    items = list(search.get_items())
+    # Prefer the newer iterator API
+    items = list(getattr(search, 'items', search.get_items)())
     best = pick_best_cloud_item(items)
     if not best:
         raise RuntimeError('No Sentinel-2 L2A items found for AOI/date/cloud filters')
     best = pc.sign(best)
+    outputs = []
     for band, out_name in [('B04', 'B04.tif'), ('B08', 'B08.tif')]:
         asset = best.assets.get(band)
         if asset is None:
             raise RuntimeError(f'Missing asset {band} in selected Sentinel item')
         href = asset.href
         out_path = SENTINEL_DIR / out_name
-        with rasterio.open(href) as src:
-            geoms = [mapping(g) for g in aoi_gdf.geometry]
-            out_image, out_transform = rio_mask(src, geoms, crop=True)
-            meta = src.meta.copy()
-            meta.update({'height': out_image.shape[1], 'width': out_image.shape[2], 'transform': out_transform})
-            out_path.parent.mkdir(parents=True, exist_ok=True)
-            with rasterio.open(out_path, 'w', **meta) as dst:
-                dst.write(out_image)
-    return [SENTINEL_DIR / 'B04.tif', SENTINEL_DIR / 'B08.tif']
+        # Use clip_write which handles CRS and masking
+        clip_write(href, aoi_gdf, out_path)
+        outputs.append(out_path)
+    return outputs
 
 
 def daterange(start: datetime, end: datetime):
@@ -185,10 +192,11 @@ def daterange(start: datetime, end: datetime):
 
 
 def download_chirps_daily(aoi_gdf: gpd.GeoDataFrame, start_date: str, end_date: str, skip_existing=True, max_files=None):
-    base = 'https://data.chc.ucsb.edu/products/CHIRPS-2.0/global_daily/{year}/chirps-v2.0.{year}.{month:02d}.{day:02d}.tif.gz'
+    base = 'https://data.chc.ucsb.edu/products/CHIRPS-2.0/global_daily/tifs/{year}/chirps-v2.0.{year}.{month:02d}.{day:02d}.tif.gz'
     start = datetime.fromisoformat(start_date)
     end = datetime.fromisoformat(end_date)
     count = 0
+    misses = 0
     for d in tqdm(list(daterange(start, end)), desc='CHIRPS days'):
         if max_files and count >= max_files:
             break
@@ -202,26 +210,32 @@ def download_chirps_daily(aoi_gdf: gpd.GeoDataFrame, start_date: str, end_date: 
             continue
         RAINFALL_DIR.mkdir(parents=True, exist_ok=True)
         try:
-            with requests.get(url, stream=True, timeout=60) as r:
+            with requests.get(url, stream=True, timeout=120) as r:
                 if r.status_code != 200:
+                    if misses < 5:
+                        print(f"CHIRPS missing {d.date()} HTTP {r.status_code}")
+                        misses += 1
                     continue
                 with open(gz_out, 'wb') as f:
-                    for chunk in r.iter_content(chunk_size=8192):
+                    for chunk in r.iter_content(chunk_size=1 << 15):
                         if chunk:
                             f.write(chunk)
-        except Exception:
+        except Exception as ex:
+            if misses < 5:
+                print(f"CHIRPS error {d.date()}: {ex}")
+                misses += 1
             continue
         try:
             with gzip.open(gz_out, 'rb') as f_in, open(tif_tmp, 'wb') as f_out:
                 shutil.copyfileobj(f_in, f_out)
             clip_write(tif_tmp, aoi_gdf, tif_clip)
+            count += 1
         finally:
             try:
                 gz_out.unlink(missing_ok=True)
-                tif_tmp.unlink(missing_ok=True)
+                Path(tif_tmp).unlink(missing_ok=True)
             except Exception:
                 pass
-        count += 1
     return count
 
 
