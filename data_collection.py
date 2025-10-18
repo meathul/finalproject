@@ -19,6 +19,7 @@ from rasterio.mask import mask as rio_mask
 import geopandas as gpd
 import pandas as pd
 from shapely.geometry import mapping
+import logging
 
 # Optional libs for automation
 try:
@@ -33,6 +34,9 @@ except Exception:  # pragma: no cover
     Client = None
 import requests
 from tqdm import tqdm
+
+# Configure basic logging
+logging.basicConfig(level=logging.INFO, format='[%(levelname)s] %(message)s')
 
 DATA_DIR = Path('data')
 DEM_DIR = DATA_DIR / 'dem'
@@ -191,17 +195,34 @@ def daterange(start: datetime, end: datetime):
         cur += timedelta(days=1)
 
 
+def get_requests_session():
+    """Create a requests session with a friendly User-Agent to avoid 403s."""
+    s = requests.Session()
+    s.headers.update({
+        "User-Agent": "finalproject/1.0 (CHIRPS fetcher; contact: local-user)"
+    })
+    return s
+
+
 def download_chirps_daily(aoi_gdf: gpd.GeoDataFrame, start_date: str, end_date: str, skip_existing=True, max_files=None):
-    base = 'https://data.chc.ucsb.edu/products/CHIRPS-2.0/global_daily/tifs/{year}/chirps-v2.0.{year}.{month:02d}.{day:02d}.tif.gz'
+    # Try both CHIRPS URL layouts
+    def chirps_url_candidates(y, m, d):
+        fname = f"chirps-v2.0.{y}.{m:02d}.{d:02d}.tif.gz"
+        return [
+            f"https://data.chc.ucsb.edu/products/CHIRPS-2.0/global_daily/tifs/{y}/{fname}",
+            f"https://data.chc.ucsb.edu/products/CHIRPS-2.0/global_daily/{y}/{fname}",
+        ]
+
     start = datetime.fromisoformat(start_date)
     end = datetime.fromisoformat(end_date)
     count = 0
     misses = 0
+    session = get_requests_session()
+
     for d in tqdm(list(daterange(start, end)), desc='CHIRPS days'):
         if max_files and count >= max_files:
             break
         year, month, day = d.year, d.month, d.day
-        url = base.format(year=year, month=month, day=day)
         gz_out = RAINFALL_DIR / f'chirps_{year}{month:02d}{day:02d}.tif.gz'
         tif_tmp = RAINFALL_DIR / f'chirps_{year}{month:02d}{day:02d}_tmp.tif'
         tif_clip = RAINFALL_DIR / f'chirps_{year}{month:02d}{day:02d}.tif'
@@ -209,27 +230,40 @@ def download_chirps_daily(aoi_gdf: gpd.GeoDataFrame, start_date: str, end_date: 
             count += 1
             continue
         RAINFALL_DIR.mkdir(parents=True, exist_ok=True)
-        try:
-            with requests.get(url, stream=True, timeout=120) as r:
-                if r.status_code != 200:
-                    if misses < 5:
-                        print(f"CHIRPS missing {d.date()} HTTP {r.status_code}")
-                        misses += 1
-                    continue
-                with open(gz_out, 'wb') as f:
-                    for chunk in r.iter_content(chunk_size=1 << 15):
-                        if chunk:
-                            f.write(chunk)
-        except Exception as ex:
-            if misses < 5:
-                print(f"CHIRPS error {d.date()}: {ex}")
-                misses += 1
+
+        got = False
+        last_status = None
+        for url in chirps_url_candidates(year, month, day):
+            try:
+                with session.get(url, stream=True, timeout=120) as r:
+                    last_status = r.status_code
+                    if r.status_code == 200:
+                        with open(gz_out, 'wb') as f:
+                            for chunk in r.iter_content(chunk_size=1 << 15):
+                                if chunk:
+                                    f.write(chunk)
+                        got = True
+                        break
+            except Exception as ex:
+                last_status = f'ERR {ex}'
+                continue
+
+        if not got:
+            if misses < 20:
+                logging.warning(f"CHIRPS missing {d.date()} (last={last_status})")
+            misses += 1
             continue
+
         try:
             with gzip.open(gz_out, 'rb') as f_in, open(tif_tmp, 'wb') as f_out:
                 shutil.copyfileobj(f_in, f_out)
             clip_write(tif_tmp, aoi_gdf, tif_clip)
-            count += 1
+            # Verify saved file exists and has size
+            if tif_clip.exists() and tif_clip.stat().st_size > 0:
+                logging.info(f"Saved CHIRPS to {tif_clip} ({tif_clip.stat().st_size/1024:.1f} KB)")
+                count += 1
+            else:
+                logging.error(f"Failed to create clipped CHIRPS: {tif_clip}")
         finally:
             try:
                 gz_out.unlink(missing_ok=True)

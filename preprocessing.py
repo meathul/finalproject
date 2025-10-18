@@ -34,9 +34,15 @@ HAZARD_DIR = DATA_DIR / 'hazards'
 PROCESSED_DIR = DATA_DIR / 'processed'
 PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
 OUT_CSV = PROCESSED_DIR / 'aligned_features.csv'
+# New: optional GeoTIFF output for synthetic rainfall
+OUT_SYNTH_RAIN = PROCESSED_DIR / 'synthetic_rainfall.tif'
 
 # CONFIG: hazard attribute field name candidates
 HAZARD_ATTR_CANDIDATES = ['hazard', 'risk', 'class', 'label']
+
+# New: deterministic randomness for synthetic rainfall
+RANDOM_STATE = 42
+np.random.seed(RANDOM_STATE)
 
 
 def pick_first(path_list):
@@ -63,7 +69,9 @@ def load_raster(path):
 def compute_slope(dem_path):
     """Compute slope in degrees using numpy gradient (Horn-style approximation)."""
     with rasterio.open(dem_path) as src:
-        dem = src.read(1, masked=True).filled(np.nan).astype(np.float32)
+        arr = src.read(1, masked=True)
+        # Cast to float before filling with NaN to avoid 'Cannot convert fill_value nan to dtype int16'
+        dem = arr.astype(np.float32).filled(np.nan)
         profile = src.profile
         transform = src.transform
     # Pixel size
@@ -135,6 +143,45 @@ def aggregate_rainfall(target_profile):
         accum /= count
     accum[accum == 0] = np.nan  # if zeros are nodata
     return accum
+
+
+# New: generate synthetic rainfall aligned to DEM grid
+def generate_synthetic_rainfall(dem_arr: np.ndarray, ndvi_arr: np.ndarray | None = None) -> np.ndarray:
+    """
+    Create synthetic daily rainfall (mm/day) aligned to DEM grid.
+    Heuristic: base + elevation effect + vegetation effect + small noise.
+    """
+    rain = np.full_like(dem_arr, fill_value=np.nan, dtype=np.float32)
+    valid = np.isfinite(dem_arr)
+    if not np.any(valid):
+        return rain
+
+    dem_valid = dem_arr[valid].astype(np.float32)
+    p10, p90 = np.nanpercentile(dem_valid, [10, 90])
+    denom = max(p90 - p10, 1e-6)
+    dem_norm = np.clip((dem_valid - p10) / denom, 0, 1)
+
+    if ndvi_arr is not None:
+        ndvi_valid = ndvi_arr[valid].astype(np.float32)
+        ndvi_norm = np.clip((ndvi_valid + 1.0) / 2.0, 0, 1)
+    else:
+        ndvi_norm = np.zeros_like(dem_norm, dtype=np.float32)
+
+    base = 7.0  # mm/day
+    synthetic = base + 8.0 * dem_norm + 3.0 * ndvi_norm
+    noise = np.random.normal(loc=0.0, scale=1.0, size=dem_norm.shape).astype(np.float32)
+    synthetic = np.clip(synthetic + noise, 0.0, None)
+
+    rain[valid] = synthetic
+    return rain
+
+
+# New: save helper for synthetic rainfall
+def save_raster_like(profile, arr: np.ndarray, out_path: Path):
+    p = profile.copy()
+    p.update(count=1, dtype='float32', nodata=None, compress='lzw')
+    with rasterio.open(out_path, 'w', **p) as dst:
+        dst.write(arr.astype(np.float32), 1)
 
 
 def rasterize_hazards(target_profile):
@@ -227,8 +274,18 @@ def main():
     else:
         ndvi = compute_ndvi(nir_band, red_band, dem_profile)
 
-    # Rainfall aggregate
+    # Rainfall aggregate (CHIRPS if present)
     rainfall = aggregate_rainfall(dem_profile)
+
+    # New: synthesize rainfall if missing (all-NaN)
+    if not np.isfinite(rainfall).any():
+        print("[INFO] No rainfall rasters found. Generating synthetic rainfall aligned to DEM.")
+        rainfall = generate_synthetic_rainfall(elevation, ndvi)
+        try:
+            save_raster_like(dem_profile, rainfall, OUT_SYNTH_RAIN)
+            print(f"[INFO] Saved synthetic rainfall raster to {OUT_SYNTH_RAIN}")
+        except Exception as e:
+            print(f"[WARN] Could not save synthetic rainfall raster: {e}")
 
     # Hazard rasterization
     hazard = rasterize_hazards(dem_profile)
