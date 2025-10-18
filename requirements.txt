@@ -1,0 +1,17 @@
+rasterio
+geopandas
+numpy
+pandas
+scikit-learn
+xgboost
+shap
+matplotlib
+seaborn
+pyproj
+scipy
+elevation
+osmnx
+pystac-client
+planetary-computer
+requests
+tqdm
